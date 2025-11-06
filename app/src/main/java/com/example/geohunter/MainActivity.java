@@ -10,6 +10,8 @@ import android.location.Location;
 import android.media.MediaPlayer;
 import android.os.Bundle;
 import android.os.Handler;
+import android.view.Surface;
+import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -25,8 +27,32 @@ import com.google.android.gms.maps.model.Circle;
 import com.google.android.gms.maps.model.CircleOptions;
 import com.google.android.gms.maps.model.LatLng;
 
+// CameraX
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.ImageProxy;
+import androidx.camera.core.Preview;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.camera.view.PreviewView;
+import androidx.core.content.ContextCompat;
+
+import com.google.common.util.concurrent.ListenableFuture;
+
+// ML Kit
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.face.Face;
+import com.google.mlkit.vision.face.FaceDetection;
+import com.google.mlkit.vision.face.FaceDetector;
+import com.google.mlkit.vision.face.FaceDetectorOptions;
+
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends FragmentActivity implements OnMapReadyCallback {
 
@@ -35,10 +61,22 @@ public class MainActivity extends FragmentActivity implements OnMapReadyCallback
     private List<Circle> zonasPeligrosas = new ArrayList<>();
     private LinearLayout panelEstado;
     private TextView txtEstado, txtDistancia;
-    private Button btnReiniciar;
+    private Button btnReiniciar, btnAnalizar;
+    private PreviewView previewView;
     private Handler handler = new Handler();
     private MediaPlayer alerta;
     private boolean enPeligro = false;
+    private boolean enZonaPeligrosa = false;
+    // ML/Cámara
+    private boolean analisisActivo = false;
+    private ExecutorService cameraExecutor;
+    private FaceDetector faceDetector;
+    private ListenableFuture<ProcessCameraProvider> cameraProviderFuture;
+    private ImageAnalysis imageAnalysis;
+    private Preview cameraPreview;
+    // Ventana para suavizar el riesgo de contexto
+    private final Deque<Float> contextoVentana = new ArrayDeque<>();
+    private static final int MAX_VENTANA = 10; // ~1s si ~10 FPS
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -49,15 +87,24 @@ public class MainActivity extends FragmentActivity implements OnMapReadyCallback
         txtEstado = findViewById(R.id.txtEstado);
         txtDistancia = findViewById(R.id.txtDistancia);
         btnReiniciar = findViewById(R.id.btnReiniciar);
+        btnAnalizar = findViewById(R.id.btnAnalizar);
+        previewView = findViewById(R.id.previewView);
 
         alerta = MediaPlayer.create(this, R.raw.alerta); // coloca un sonido en res/raw/alerta.mp3
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this);
+        cameraExecutor = Executors.newSingleThreadExecutor();
+        FaceDetectorOptions options = new FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                .enableTracking()
+                .build();
+        faceDetector = FaceDetection.getClient(options);
 
         SupportMapFragment mapFragment = (SupportMapFragment) getSupportFragmentManager()
                 .findFragmentById(R.id.map);
         mapFragment.getMapAsync(this);
 
         btnReiniciar.setOnClickListener(v -> generarZonasAleatorias());
+        btnAnalizar.setOnClickListener(v -> toggleAnalisis());
     }
 
     @Override
@@ -71,6 +118,9 @@ public class MainActivity extends FragmentActivity implements OnMapReadyCallback
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.ACCESS_FINE_LOCATION}, 1);
             return;
+        }
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, 2);
         }
         iniciarJuego();
     }
@@ -104,7 +154,7 @@ public class MainActivity extends FragmentActivity implements OnMapReadyCallback
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             return;
         }
-        
+
         mMap.clear();
         zonasPeligrosas.clear();
 
@@ -170,16 +220,20 @@ public class MainActivity extends FragmentActivity implements OnMapReadyCallback
                 // En zona peligrosa
                 if (!enPeligro) {
                     enPeligro = true;
+                    enZonaPeligrosa = true;
                     panelEstado.setBackgroundColor(Color.parseColor("#AAFF0000"));
                     txtEstado.setText("⚠️ ¡PELIGRO! Sal de la zona roja");
-                    if (!alerta.isPlaying()) alerta.start();
+                    // Activar cámara automáticamente para análisis
+                    if (!analisisActivo) iniciarAnalisis();
                 }
             } else {
                 // Zona segura
                 if (enPeligro) alerta.pause();
                 enPeligro = false;
+                enZonaPeligrosa = false;
                 panelEstado.setBackgroundColor(Color.parseColor("#AA00FF00"));
                 txtEstado.setText("Zona segura ✅");
+                if (analisisActivo) detenerAnalisis();
             }
         });
     }
@@ -189,5 +243,111 @@ public class MainActivity extends FragmentActivity implements OnMapReadyCallback
         super.onDestroy();
         handler.removeCallbacksAndMessages(null);
         if (alerta != null) alerta.release();
+        detenerAnalisis();
+        if (cameraExecutor != null) cameraExecutor.shutdown();
+    }
+
+    // ====== Integración CameraX + Image Labeling (no altera la lógica existente) ======
+
+    private void toggleAnalisis() {
+        if (analisisActivo) {
+            detenerAnalisis();
+        } else {
+            iniciarAnalisis();
+        }
+    }
+
+    private void iniciarAnalisis() {
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            ActivityCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA}, 2);
+            return;
+        }
+        analisisActivo = true;
+        previewView.setVisibility(View.VISIBLE);
+        btnAnalizar.setText("Detener análisis");
+        configurarCamara();
+    }
+
+    private void detenerAnalisis() {
+        analisisActivo = false;
+        btnAnalizar.setText("Analizar entorno");
+        previewView.setVisibility(View.GONE);
+        contextoVentana.clear();
+        if (cameraProviderFuture != null) {
+            try {
+                ProcessCameraProvider provider = cameraProviderFuture.get();
+                provider.unbindAll();
+            } catch (Exception ignored) { }
+        }
+    }
+
+    private void configurarCamara() {
+        cameraProviderFuture = ProcessCameraProvider.getInstance(this);
+        cameraProviderFuture.addListener(() -> {
+            try {
+                ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
+
+                cameraPreview = new Preview.Builder().build();
+                cameraPreview.setSurfaceProvider(previewView.getSurfaceProvider());
+
+                imageAnalysis = new ImageAnalysis.Builder()
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .setTargetRotation(getWindowManager().getDefaultDisplay().getRotation())
+                        .build();
+
+                imageAnalysis.setAnalyzer(cameraExecutor, this::procesarFrame);
+
+                CameraSelector cameraSelector = new CameraSelector.Builder()
+                        .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+                        .build();
+
+                cameraProvider.unbindAll();
+                cameraProvider.bindToLifecycle(this, cameraSelector, cameraPreview, imageAnalysis);
+            } catch (Exception e) {
+                e.printStackTrace();
+                Toast.makeText(this, "No se pudo iniciar la cámara", Toast.LENGTH_SHORT).show();
+            }
+        }, ContextCompat.getMainExecutor(this));
+    }
+
+    private void procesarFrame(ImageProxy imageProxy) {
+        if (!analisisActivo) {
+            imageProxy.close();
+            return;
+        }
+        try {
+            if (imageProxy.getImage() == null) {
+                imageProxy.close();
+                return;
+            }
+            int rotationDegrees = imageProxy.getImageInfo().getRotationDegrees();
+            InputImage image = InputImage.fromMediaImage(imageProxy.getImage(), rotationDegrees);
+
+            faceDetector.process(image)
+                    .addOnSuccessListener(faces -> {
+                        boolean hayPersona = faces != null && !faces.isEmpty();
+
+                        // Sonido solo si se detecta rostro dentro de zona peligrosa
+                        if (enZonaPeligrosa && hayPersona) {
+                            if (!alerta.isPlaying()) alerta.start();
+                        } else {
+                            if (alerta.isPlaying() && enPeligro) alerta.pause();
+                        }
+                    })
+                    .addOnFailureListener(Throwable::printStackTrace)
+                    .addOnCompleteListener(task -> imageProxy.close());
+        } catch (Exception e) {
+            e.printStackTrace();
+            imageProxy.close();
+        }
+    }
+
+    // Ya no se necesita conversión; ML Kit espera grados (0/90/180/270) directamente
+
+    // Eliminamos lógica de contexto basada en etiquetas para simplificar al usar rostro
+
+    private void aplicarRiesgoContextual(float contextRiskAvg) {
+        // Mantener por si luego se desea usar el promedio de contexto para UI;
+        // ahora no modifica sonido ni color (la UI principal la gestiona verificarZona).
     }
 }

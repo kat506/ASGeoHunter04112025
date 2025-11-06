@@ -40,6 +40,14 @@ dependencies {
     testImplementation(libs.junit)
     implementation("com.google.android.gms:play-services-maps:18.1.0")
     implementation("com.google.android.gms:play-services-location:21.3.0")
+    // CameraX
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
+    // ML Kit Image Labeling (on-device)
+    implementation("com.google.mlkit:image-labeling:17.0.9")
+    // ML Kit Face Detection (on-device)
+    implementation("com.google.mlkit:face-detection:16.1.7")
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.espresso.core)
 }

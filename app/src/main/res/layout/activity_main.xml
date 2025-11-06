@@ -12,6 +12,13 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <!-- Preview de cámara para análisis (inicialmente oculto) -->
+    <androidx.camera.view.PreviewView
+        android:id="@+id/previewView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
     <!-- Panel superior de estado -->
     <LinearLayout
         android:id="@+id/panelEstado"
@@ -48,6 +55,17 @@
         android:layout_height="wrap_content"
         android:layout_alignParentBottom="true"
         android:layout_centerHorizontal="true"
+        android:layout_marginBottom="20dp" />
+
+    <!-- Botón para activar/desactivar análisis ML -->
+    <Button
+        android:id="@+id/btnAnalizar"
+        android:text="Analizar entorno"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_alignParentBottom="true"
+        android:layout_alignParentStart="true"
+        android:layout_marginStart="16dp"
         android:layout_marginBottom="20dp" />
 
 </RelativeLayout>
